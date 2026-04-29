@@ -7,7 +7,7 @@ import pytest
 from unittest.mock import AsyncMock, patch
 
 from tonn_mcp.tools.account import build_account_response
-from tonn_mcp.tools.upload import call_upload
+from tonn_mcp.tools.upload import call_upload_and_transfer
 from tonn_mcp.tools.analysis import call_analyse_mix
 from tonn_mcp.tools.mastering import call_master_track
 from tonn_mcp.tools.status import call_get_job_status
@@ -52,37 +52,59 @@ class TestAccountTool:
 
 @pytest.mark.asyncio
 class TestUploadTool:
-    async def test_success(self):
+    async def test_success_with_base64(self):
+        import base64
+
         resp_data = {
             "signed_url": "https://storage.googleapis.com/bucket/track.wav?sig=abc",
             "readable_url": "https://storage.googleapis.com/bucket/track.wav",
         }
+        file_bytes = b"RIFF" + b"\x00" * 100
+        file_b64 = base64.b64encode(file_bytes).decode()
+
         mock_client = AsyncMock()
         mock_client.post.return_value = _mock_response(200, resp_data)
+        mock_client.put.return_value = _mock_response(200, {})
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
         with patch("tonn_mcp.tools.upload.httpx.AsyncClient", return_value=mock_client):
-            result = await call_upload(
+            result = await call_upload_and_transfer(
                 filename="track.wav",
-                content_type="audio/wav",
+                file_data_base64=file_b64,
+                file_url=None,
                 api_key=API_KEY,
                 api_base=API_BASE,
                 credits_remaining=1000,
             )
 
         parsed = _parse(result)
-        assert "signed_url" in parsed["data"]
         assert parsed["credits_charged"] == 0
         assert "track.wav" in parsed["summary"]
+        assert "uploaded" in parsed["summary"].lower()
+        assert parsed["data"]["track_url"] == "https://storage.googleapis.com/bucket/track.wav"
 
-        # Verify correct API call
-        call_args = mock_client.post.call_args
-        assert call_args[0][0] == "https://tonn.roexaudio.com/upload"
-        assert call_args[1]["json"] == {"filename": "track.wav", "contentType": "audio/wav"}
-        assert call_args[1]["params"] == {"key": API_KEY}
+        post_args = mock_client.post.call_args
+        assert post_args[0][0] == "https://tonn.roexaudio.com/upload"
+        assert post_args[1]["json"] == {"filename": "track.wav", "contentType": "audio/wav"}
 
-    async def test_error(self):
+        put_args = mock_client.put.call_args
+        assert put_args[0][0] == resp_data["signed_url"]
+
+    async def test_unsupported_extension(self):
+        result = await call_upload_and_transfer(
+            filename="track.xyz",
+            file_data_base64="AAAA",
+            file_url=None,
+            api_key=API_KEY,
+            api_base=API_BASE,
+            credits_remaining=1000,
+        )
+
+        parsed = _parse(result)
+        assert "Unsupported" in parsed["summary"]
+
+    async def test_api_error(self):
         resp_data = {"error": True, "message": "Invalid content type"}
         mock_client = AsyncMock()
         mock_client.post.return_value = _mock_response(400, resp_data)
@@ -90,9 +112,10 @@ class TestUploadTool:
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
         with patch("tonn_mcp.tools.upload.httpx.AsyncClient", return_value=mock_client):
-            result = await call_upload(
-                filename="track.xyz",
-                content_type="application/octet-stream",
+            result = await call_upload_and_transfer(
+                filename="track.wav",
+                file_data_base64="AAAA",
+                file_url=None,
                 api_key=API_KEY,
                 api_base=API_BASE,
                 credits_remaining=1000,

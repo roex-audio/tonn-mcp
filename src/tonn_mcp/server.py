@@ -80,20 +80,26 @@ async def get_account_status() -> str:
 
 
 @mcp.tool()
-async def get_upload_url(filename: str, content_type: str) -> str:
-    """Get a signed URL for uploading an audio file.
+async def upload_file(
+    filename: str,
+    file_data_base64: str = "",
+    file_url: str = "",
+) -> str:
+    """Upload an audio file to Tonn for processing.
 
-    Supported types: audio/wav, audio/mpeg, audio/flac, audio/aiff.
+    Provide the file as base64 data OR a URL where the file can be fetched.
+    Supported formats: wav, mp3, flac, aiff.
     """
-    from tonn_mcp.tools.upload import call_upload
+    from tonn_mcp.tools.upload import call_upload_and_transfer
 
     ctx = _get_user_context()
     if not ctx or not ctx.api_key:
         return '{"error": "Not authenticated or missing API key"}'
 
-    return await call_upload(
+    return await call_upload_and_transfer(
         filename=filename,
-        content_type=content_type,
+        file_data_base64=file_data_base64 or None,
+        file_url=file_url or None,
         api_key=ctx.api_key,
         api_base=API_URL,
         credits_remaining=ctx.credits_remaining,
