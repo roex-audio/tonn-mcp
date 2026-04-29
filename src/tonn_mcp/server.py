@@ -9,8 +9,9 @@ from urllib.parse import urlparse
 from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
-from starlette.responses import JSONResponse
-from starlette.routing import Mount
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse
+from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -222,7 +223,7 @@ class OriginValidationMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
         if scope["type"] == "http":
             path = scope.get("path", "")
-            if not path.startswith("/.well-known"):
+            if not path.startswith("/.well-known") and not path.startswith("/upload"):
                 headers = dict(scope.get("headers", []))
                 origin = headers.get(b"origin", b"").decode()
                 if origin and origin not in ALLOWED_ORIGINS:
@@ -232,6 +233,137 @@ class OriginValidationMiddleware:
                     await response(scope, receive, send)
                     return
         await self.app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
+# REST upload endpoint (for files too large for MCP tool call args)
+# ---------------------------------------------------------------------------
+
+UPLOAD_PAGE_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Tonn – Upload Audio</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#0a0a0a;color:#e5e5e5;
+display:flex;justify-content:center;align-items:center;min-height:100vh}
+.card{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:2.5rem;
+max-width:480px;width:100%}
+h1{font-size:1.4rem;margin-bottom:.5rem}
+p{color:#999;font-size:.9rem;margin-bottom:1.5rem}
+.drop{border:2px dashed #444;border-radius:8px;padding:3rem 1rem;text-align:center;
+cursor:pointer;transition:border-color .2s}
+.drop.over{border-color:#6366f1}
+.drop input{display:none}
+.drop label{cursor:pointer;color:#6366f1}
+#status{margin-top:1rem;font-size:.85rem;word-break:break-all}
+.url-box{background:#111;border:1px solid #333;border-radius:6px;padding:.75rem;
+margin-top:.75rem;font-family:monospace;font-size:.8rem;user-select:all}
+button{background:#6366f1;color:#fff;border:none;border-radius:6px;padding:.5rem 1rem;
+cursor:pointer;margin-top:.75rem;font-size:.85rem}
+button:hover{background:#4f46e5}
+</style></head><body>
+<div class="card">
+<h1>Upload Audio to Tonn</h1>
+<p>Drop a file here, then paste the URL into Claude.</p>
+<div class="drop" id="drop">
+<p>Drag & drop audio file here</p>
+<p style="margin-top:.5rem">or <label for="file">browse</label></p>
+<input type="file" id="file" accept=".wav,.mp3,.flac,.aiff,.aif">
+</div>
+<div id="status"></div>
+</div>
+<script>
+const drop=document.getElementById('drop'),file=document.getElementById('file'),
+status=document.getElementById('status');
+drop.addEventListener('dragover',e=>{e.preventDefault();drop.classList.add('over')});
+drop.addEventListener('dragleave',()=>drop.classList.remove('over'));
+drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('over');
+if(e.dataTransfer.files.length)upload(e.dataTransfer.files[0])});
+file.addEventListener('change',()=>{if(file.files.length)upload(file.files[0])});
+async function upload(f){
+status.innerHTML='Uploading '+f.name+'...';
+const fd=new FormData();fd.append('file',f);
+try{
+const r=await fetch('/upload',{method:'POST',body:fd});
+const d=await r.json();
+if(d.track_url){
+status.innerHTML='Ready! Paste this URL into Claude:<div class="url-box">'+d.track_url+
+'</div><button onclick="navigator.clipboard.writeText(\\''+d.track_url+
+'\\')">Copy URL</button>';
+}else{status.innerHTML='Error: '+(d.error||JSON.stringify(d))}
+}catch(e){status.innerHTML='Upload failed: '+e.message}
+}
+</script></body></html>"""
+
+
+async def upload_page(request: Request):
+    return HTMLResponse(UPLOAD_PAGE_HTML)
+
+
+async def handle_upload(request: Request):
+    """Accept multipart file upload, push to GCS via Tonn API, return track_url."""
+    import httpx
+
+    auth_header = request.headers.get("authorization", "")
+    # For browser uploads, check for a cookie-based session or allow if from same origin
+    # For simplicity, use the API key from a query param or header
+    api_key = request.query_params.get("key", "")
+
+    if not api_key:
+        # Try to get API key from Bearer token via introspection
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            cached = _verifier._cache.get(token)
+            if cached:
+                api_key = cached.api_key or ""
+
+    if not api_key:
+        return JSONResponse({"error": "API key required. Pass ?key=YOUR_API_KEY"}, status_code=401)
+
+    form = await request.form()
+    uploaded = form.get("file")
+    if not uploaded:
+        return JSONResponse({"error": "No file provided"}, status_code=400)
+
+    filename = uploaded.filename
+    file_bytes = await uploaded.read()
+
+    from tonn_mcp.tools.upload import _guess_content_type
+    content_type = _guess_content_type(filename)
+    if not content_type:
+        return JSONResponse({"error": f"Unsupported file type: {filename}"}, status_code=400)
+
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(
+            API_URL.rstrip("/") + "/upload",
+            json={"filename": filename, "contentType": content_type},
+            params={"key": api_key},
+        )
+        try:
+            data = resp.json()
+        except Exception:
+            return JSONResponse({"error": "Tonn API error", "status": resp.status_code}, status_code=502)
+
+        if resp.status_code != 200 or data.get("error"):
+            return JSONResponse({"error": data.get("message", "Upload URL failed")}, status_code=502)
+
+        signed_url = data.get("signed_url")
+        readable_url = data.get("readable_url")
+
+        put_resp = await client.put(
+            signed_url,
+            content=file_bytes,
+            headers={"Content-Type": content_type},
+            timeout=httpx.Timeout(120.0, connect=10.0),
+        )
+        if put_resp.status_code not in (200, 201):
+            return JSONResponse({"error": f"GCS upload failed ({put_resp.status_code})"}, status_code=502)
+
+    return JSONResponse({
+        "track_url": readable_url,
+        "filename": filename,
+        "size_bytes": len(file_bytes),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +381,8 @@ async def lifespan(application: Starlette):
 
 app = Starlette(
     routes=[
+        Route("/upload", upload_page, methods=["GET"]),
+        Route("/upload", handle_upload, methods=["POST"]),
         Mount("/", app=mcp.streamable_http_app()),
     ],
     middleware=[Middleware(OriginValidationMiddleware)],
