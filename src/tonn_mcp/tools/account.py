@@ -15,8 +15,8 @@ def build_account_response(
             "credits_remaining": credits_remaining,
         },
         next_actions=[
-            {"tool": "get_upload_url", "description": "Upload an audio file"},
             {"tool": "analyse_mix", "description": "Analyse a mix or master"},
+            {"tool": "master_track", "description": "Master a track"},
         ],
         credits_remaining=credits_remaining,
         credits_charged=0,
